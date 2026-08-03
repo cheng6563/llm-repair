@@ -114,12 +114,20 @@ parser.add_argument(
     default=True,
     help="归一化 SSE usage 字段（修复 B API 的 statusline 上下文计数偏小问题），默认开启",
 )
+parser.add_argument(
+    "--retry-shield",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help="护盾：补全端点的空回复（200 但无文本/思考/工具调用）与上游 4xx/5xx "
+         "一律改写成 429 + Retry-After，让客户端自己重试。默认开启",
+)
 args, _ = parser.parse_known_args()
 
 PORT = args.port
 LOG_DIR = Path(args.log_dir)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 FIX_USAGE = args.fix_usage
+RETRY_SHIELD = args.retry_shield
 MAX_LOG_BYTES = int(args.max_log_size * 1024 * 1024 * 1024)
 
 # ---------- 日志 ----------
@@ -148,6 +156,110 @@ HOP_BY_HOP = {
 
 def filter_resp_headers(headers: httpx.Headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
+
+
+# ---------- 重试护盾（空回复 / 上游错误 → 429） ----------
+# 背景：部分三方渠道对某些请求会返回 HTTP 200 + 合法 SSE + [DONE]，但正文里
+#   没有任何可见输出（无 text / thinking / tool_use，completion_tokens≈0）。
+#   客户端（codex 等）把这当成“对话正常结束”，于是静默退出、不报错、不重试。
+#   护盾把这类空回复、以及上游 4xx/5xx，统一改写成 429 + Retry-After，让
+#   CPA / codex 走各自的重试与渠道轮换逻辑，把无声失败变成可自愈的可见状态。
+# 只作用于“补全端点”，避免误伤 /v1/models 等辅助接口。
+_COMPLETION_PATH_SUFFIXES = (
+    "/messages", "/chat/completions", "/responses", "/completions",
+)
+
+
+def _is_completion_path(path: str) -> bool:
+    p = (path or "").rstrip("/").lower()
+    return any(p.endswith(s) for s in _COMPLETION_PATH_SUFFIXES)
+
+
+def _sse_has_visible_output(events: list) -> bool:
+    """扫描已解析的 SSE 事件，判断是否有任何可见输出。
+
+    覆盖两种上游形状：
+      - OpenAI chat.completion.chunk：choices[].delta 的 content /
+        reasoning_content / reasoning / tool_calls 任一非空。
+      - Anthropic messages：content_block_delta 的 text_delta /
+        thinking_delta / input_json_delta，或 content_block_start 里的 tool_use。
+    只要出现一处真实内容即返回 True；整条流都没有才判为空。
+    """
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        t = e.get("type")
+        # Anthropic
+        if t == "content_block_start":
+            cb = e.get("content_block") or {}
+            if cb.get("type") == "tool_use":
+                return True
+            if (cb.get("text") or cb.get("thinking")):
+                return True
+        if t == "content_block_delta":
+            d = e.get("delta") or {}
+            dt = d.get("type")
+            if dt == "text_delta" and d.get("text"):
+                return True
+            if dt == "thinking_delta" and d.get("thinking"):
+                return True
+            if dt == "input_json_delta":
+                return True
+        # OpenAI
+        for ch in (e.get("choices") or []):
+            if not isinstance(ch, dict):
+                continue
+            d = ch.get("delta") or {}
+            if isinstance(d, dict):
+                if d.get("content") or d.get("reasoning_content") \
+                        or d.get("reasoning") or d.get("tool_calls"):
+                    return True
+    return False
+
+
+def _json_has_visible_output(body) -> bool:
+    """非流式响应判空：OpenAI choices[].message 或 Anthropic content 有实质内容。"""
+    if not isinstance(body, dict):
+        return True  # 非 JSON（无法判定）一律放行，不误杀
+    # Anthropic
+    if isinstance(body.get("content"), list):
+        for blk in body["content"]:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") == "tool_use":
+                return True
+            if blk.get("text") or blk.get("thinking"):
+                return True
+        # content 是列表但没有任何实质块 → 空
+        if "choices" not in body:
+            return False
+    # OpenAI
+    for ch in (body.get("choices") or []):
+        if not isinstance(ch, dict):
+            continue
+        msg = ch.get("message") or {}
+        if msg.get("content") or msg.get("reasoning_content") \
+                or msg.get("reasoning") or msg.get("tool_calls"):
+            return True
+    if "choices" in body:
+        return False
+    return True  # 既非 Anthropic 也非 OpenAI 形状：放行
+
+
+def _rate_limited_response(is_anthropic: bool, reason: str) -> Response:
+    """构造 429，body 按客户端协议给对应错误形状，带 Retry-After 触发重试。"""
+    if is_anthropic:
+        payload = {"type": "error",
+                   "error": {"type": "overloaded_error", "message": reason}}
+    else:
+        payload = {"error": {"message": reason, "type": "rate_limit_error",
+                             "code": "rate_limit_exceeded"}}
+    return Response(
+        content=json.dumps(payload, ensure_ascii=False),
+        status_code=429,
+        headers={"Retry-After": "1"},
+        media_type="application/json",
+    )
 
 
 def _resolve_target(request: Request) -> str:
@@ -252,6 +364,10 @@ async def proxy(request: Request, path: str):
     parsed = urllib.parse.urlparse(url)
     model = _extract_model(body_text)
     fix_usage = FIX_USAGE and _model_wants_usage_fix(model)
+    # 护盾仅对补全端点生效；is_anthropic 决定 429 错误体用哪种协议形状
+    shield = RETRY_SHIELD and request.method == "POST" \
+        and _is_completion_path(parsed.path)
+    is_anthropic = (parsed.path or "").rstrip("/").lower().endswith("/messages")
     session = {
         "id": req_id,
         "ts": started_at.isoformat(timespec="milliseconds"),
@@ -283,12 +399,60 @@ async def proxy(request: Request, path: str):
     if is_sse:
         # 流式：边转发边缓存，流结束后写一份会话日志
         chunks: list[bytes] = []
+        # peek 与续读必须共用同一个字节迭代器——对同一响应二次调用 aiter_bytes()
+        # 会因流已被消费而中断（IncompleteRead）。持有单一迭代器，peek 时 break
+        # 暂停，stream_gen 里接着往下读。
+        byte_iter = upstream_resp.aiter_bytes()
+
+        # --- 护盾 peek：发头前先缓冲，扫描到可见输出才转直通；整条流为空则 429 ---
+        # 正常回复内容很快就来，peek 几乎不加延迟；空回复本就结束得快，不拖时间。
+        # 上游状态码本身是错误（4xx/5xx）时，同样吞掉并改 429。
+        peek_err = None
+        if shield:
+            try:
+                if upstream_resp.status_code >= 400:
+                    peek_err = f"上游 {upstream_resp.status_code}"
+                else:
+                    async for chunk in byte_iter:
+                        chunks.append(chunk)
+                        buffered = b"".join(chunks).decode("utf-8", errors="replace")
+                        if _sse_has_visible_output(_parse_sse_body(buffered)):
+                            break          # 有内容 → 跳出 peek，走下面的直通流
+                    else:
+                        peek_err = "空回复"  # 流自然结束仍无可见输出
+            except Exception as e:
+                peek_err = f"上游读取异常 {type(e).__name__}"
+
+        if shield and peek_err:
+            full = b"".join(chunks).decode("utf-8", errors="replace")
+            session["status"] = upstream_resp.status_code
+            session["streaming"] = True
+            session["completed"] = True
+            session["shielded"] = peek_err
+            session["response"] = {
+                "headers": dict(upstream_resp.headers),
+                "events": _parse_sse_body(full),
+            }
+            _write_session(session)
+            _maybe_cleanup_logs()
+            log.info(f"[{req_id}] 护盾：{peek_err} → 429（{len(full)} 字符）")
+            try:
+                await upstream_resp.aclose()
+            except Exception:
+                pass
+            return _rate_limited_response(is_anthropic, f"upstream {peek_err}, retry")
+
+        replay = list(chunks)  # peek 已缓冲的分块，直通阶段先原样重放
 
         async def stream_gen():
             normalizer = _SSEUsageNormalizer(enabled=fix_usage)
             completed = False
             try:
-                async for chunk in upstream_resp.aiter_bytes():
+                for chunk in replay:              # 重放 peek 缓冲，保持分块顺序
+                    out = normalizer.feed(chunk)
+                    if out:
+                        yield out.encode("utf-8")
+                async for chunk in byte_iter:      # 接着 peek 停下的位置继续读
                     chunks.append(chunk)              # 原始留存，供日志/排查
                     out = normalizer.feed(chunk)      # 必要时归一化 Claude usage
                     if out:
@@ -347,16 +511,30 @@ async def proxy(request: Request, path: str):
         except Exception:
             body_decoded = f"<binary {len(content)} bytes>"
 
+        # 护盾：补全端点的上游错误 / 空回复 → 429
+        shield_reason = None
+        if shield:
+            if upstream_resp.status_code >= 400:
+                shield_reason = f"上游 {upstream_resp.status_code}"
+            elif not _json_has_visible_output(body_decoded):
+                shield_reason = "空回复"
+
         session["status"] = upstream_resp.status_code
         session["streaming"] = False
+        if shield_reason:
+            session["shielded"] = shield_reason
         session["response"] = {
             "headers": dict(upstream_resp.headers),
             "body": body_decoded,
         }
         _write_session(session)
         _maybe_cleanup_logs()
-        log.info(f"[{req_id}] 完成，{len(content)} bytes")
 
+        if shield_reason:
+            log.info(f"[{req_id}] 护盾：{shield_reason} → 429（{len(content)} bytes）")
+            return _rate_limited_response(is_anthropic, f"upstream {shield_reason}, retry")
+
+        log.info(f"[{req_id}] 完成，{len(content)} bytes")
         return Response(
             content=content,
             status_code=upstream_resp.status_code,
