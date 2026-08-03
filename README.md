@@ -1,0 +1,1 @@
+- 复制docker-compose.yml.example为docker-compose.yml，然后`docker-compose up -d`启动

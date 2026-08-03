@@ -3,12 +3,7 @@ services:
     build: .
     container_name: llm-repair
     restart: unless-stopped
+    ports:
+      - "38787:38787"
     volumes:
       - ./logs:/data/logs
-    networks:
-      - app-net
-
-networks:
-  app-net:
-    external: true
-    name: app-net

@@ -15,7 +15,7 @@
       ANTHROPIC_BASE_URL=http://127.0.0.1:38787/ai.usmercari.com/api/v3
       → /ai.usmercari.com/api/v3/v1/messages 反代到 https://ai.usmercari.com/api/v3/v1/messages
 
-日志目录: C:/tmp/gpt_llm_proxy/（可用 --log-dir 覆盖）
+日志目录: 当前脚本目录下的 logs/（可用 --log-dir 覆盖）
   YYYY-MM-DD/HH/<req_id>.json
       每个请求一个独立文件，按 日期/小时 分子目录。内容是单个完整的
       请求+响应对象（缩进美化，可直接打开阅读）。
@@ -33,38 +33,9 @@
 代理设置: 设置环境变量 HTTPS_PROXY=http://127.0.0.1:30808 即可走本地代理
 
 ==============================================================================
-工具调用参数清洗（_SSEToolCleaner）—— 重要备忘，勿随意删
+usage 归一化（_SSEUsageNormalizer）—— 重要备忘，勿随意删
 ==============================================================================
-问题：经第三方聚合站（如 ai.usmercari.com）把 Anthropic 请求转发给 OpenAI 系
-      模型时，上游用 OpenAI Responses API，会把工具 schema 规范化成 strict 模式
-      （additionalProperties:false + 所有字段强制 required）。于是模型被迫输出
-      每一个可选参数，把不需要的填成空串或哨兵占位符（””、”>>>undefined<<<”、
-      “:omit”）。这些”假值”撞上 Claude Code 端的互斥/非空校验（典型：EnterWorktree
-      的 name 与 path 互斥），导致工具调用反复报 InputValidationError、疯狂试错。
-
-      实测证据：3 次成功调用，上游原始 input 每次都是
-        {“name”:””,”path”:”.../worktrees/channel-routing-design”}
-      模型行为始终没变 —— 提示词纠正无效，因为 strict 是语法层强制，模型没有
-      “省略某个键”的自由。真正治本只能在反代层做。
-
-根治：在 SSE 流里拦截 tool_use 块，把 input 中值为 None/””/”>>>undefined<<<”/
-      “:omit” 的字段删掉再下发给客户端（见 _SSEToolCleaner / _clean_tool_input）。
-      对所有工具通用，不依赖模型配合。无脏字段时原样透传、零副作用；解析失败时
-      原样回放，绝不破坏流。日志 resp.json 的 tool_args_cleaned 记录清洗了几处。
-
-维护：
-  - 日志若出现新的占位符样式，加进 _TOOL_ARG_SENTINELS 即可。
-  - 仅对请求体 model 含 “gpt” 字样的模型启用清洗（strict 模式是 OpenAI 系
-    走 Responses API 时特有的）。原生 Claude 模型一律透传、不清洗，避免误删
-    它们合法传入的空串。匹配关键字见 _TOOL_CLEAN_MODEL_KEYWORDS，需扩展到
-    其它 OpenAI 系命名（如 o3、o4）时往里加即可。
-  - 清洗只删 None 和上述哨兵字符串，保留 0 / false / [] / {} 等有效值；极少数
-    “确实需要传空串”的工具参数会被误删，遇到再按工具名做白名单豁免。
-
-==============================================================================
-usage 归一化（_SSEToolCleaner）—— 重要备忘，勿随意删
-==============================================================================
-问题：部分三方 API（如某些 B 渠道）的 SSE 响应中，message_start 与 message_delta
+问题：部分三方 Claude API（如某些 B 渠道）的 SSE 响应中，message_start 与 message_delta
       两个事件对 usage 字段的报告存在严重不一致：
         message_start.usage  = {input:5719, cache_read:0, cache_create:49933}  ← 完整
         message_delta.usage  = {input:1850, cache_read:0, cache_create:16148}  ← 残缺
@@ -80,7 +51,7 @@ usage 归一化（_SSEToolCleaner）—— 重要备忘，勿随意删
         message_delta total =  17 998 tokens（ephemeral_5m，错误）
         statusline 显示     =      18K → 16K（每轮递减，实为 5min 缓存过期重建）
 
-根治：在 _SSEToolCleaner._handle 里仅改写 message_delta（对所有模型生效）：
+根治：在 _SSEUsageNormalizer._handle 里仅改写 Claude 的 message_delta：
   - message_start：只做静默记录（self._start_usage），不改写任何字段。
     ★ 不改 start 是刻意的：CC 用 start.cache_read 判断是否触发自动压缩；
       若把 cache_read 从 0 改为 ~123K，会导致 CC 错误触发压缩，即使模型
@@ -120,7 +91,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
 
 # ---------- CLI 参数 ----------
-_DEFAULT_LOG_DIR = Path("C:/tmp/gpt_llm_proxy")
+_DEFAULT_LOG_DIR = Path(__file__).resolve().parent / "logs"
 
 parser = argparse.ArgumentParser(
     description="LLM 反代日志工具（上游由请求路径首段的编码 URL/域名指定）"
@@ -129,7 +100,7 @@ parser.add_argument("--port", type=int, default=38787, help="本地监听端口"
 parser.add_argument(
     "--log-dir",
     default=str(_DEFAULT_LOG_DIR),
-    help=f"日志目录，默认放在系统临时目录下：{_DEFAULT_LOG_DIR}",
+    help=f"日志目录，默认为当前脚本目录下的 logs：{_DEFAULT_LOG_DIR}",
 )
 parser.add_argument(
     "--max-log-size",
@@ -280,7 +251,6 @@ async def proxy(request: Request, path: str):
 
     parsed = urllib.parse.urlparse(url)
     model = _extract_model(body_text)
-    clean_tools = _model_wants_cleaning(model)
     fix_usage = FIX_USAGE and _model_wants_usage_fix(model)
     session = {
         "id": req_id,
@@ -290,7 +260,6 @@ async def proxy(request: Request, path: str):
         "host": parsed.hostname,
         "path": parsed.path,
         "model": model,
-        "tool_clean_enabled": clean_tools,
         "fix_usage_enabled": fix_usage,
         "request": {"headers": dict(req_headers), "body": body_text},
     }
@@ -316,16 +285,16 @@ async def proxy(request: Request, path: str):
         chunks: list[bytes] = []
 
         async def stream_gen():
-            cleaner = _SSEToolCleaner(enabled=clean_tools, fix_usage=fix_usage)
+            normalizer = _SSEUsageNormalizer(enabled=fix_usage)
             completed = False
             try:
                 async for chunk in upstream_resp.aiter_bytes():
                     chunks.append(chunk)              # 原始留存，供日志/排查
-                    out = cleaner.feed(chunk)         # 清洗工具参数后再下发
+                    out = normalizer.feed(chunk)      # 必要时归一化 Claude usage
                     if out:
                         yield out.encode("utf-8")
                 # 仅在正常读完时吐残留——此处 yield 安全。
-                tail = cleaner.flush()
+                tail = normalizer.flush()
                 if tail:
                     yield tail.encode("utf-8")
                 completed = True
@@ -340,8 +309,7 @@ async def proxy(request: Request, path: str):
                     session["status"] = upstream_resp.status_code
                     session["streaming"] = True
                     session["completed"] = completed  # False=客户端中途断开
-                    session["tool_args_cleaned"] = cleaner.cleaned_count
-                    session["usage_normalized"] = cleaner.usage_normalized
+                    session["usage_normalized"] = normalizer.usage_normalized
                     session["response"] = {
                         "headers": dict(upstream_resp.headers),
                         "events": _parse_sse_body(full),
@@ -351,9 +319,7 @@ async def proxy(request: Request, path: str):
                     log.info(
                         f"[{req_id}] SSE {'完成' if completed else '中断'}，"
                         f"{len(full)} 字符"
-                        + (f"，清洗工具参数 {cleaner.cleaned_count} 处"
-                           if cleaner.cleaned_count else "")
-                        + ("，usage 已归一化" if cleaner.usage_normalized else "")
+                        + ("，usage 已归一化" if normalizer.usage_normalized else "")
                     )
                 except Exception as e:
                     log.warning(f"[{req_id}] SSE 会话记录失败: {e}")
@@ -554,20 +520,8 @@ def _parse_sse_body(raw: str) -> list:
     return events
 
 
-# ---------- 工具调用参数清洗 ----------
-# 背景：上游（OpenAI Responses API）会把工具 schema 规范化成 strict 模式，强制
-# 模型输出所有可选参数。模型只能把不需要的参数填成空串 / 哨兵占位符，导致
-# Claude Code 端互斥校验或非空校验报错（如 EnterWorktree 的 name/path）。
-# 这里在 SSE 流中把 tool_use 输入里这些“假值”字段删掉，还原成干净的参数。
-_TOOL_ARG_SENTINELS = ("", ">>>undefined<<<", ":omit")
-
-# strict 模式只在 OpenAI 系模型走 Responses API 时出现，故清洗仅对请求体 model
-# 含这些关键字的模型启用；原生 Claude 等模型一律透传。需覆盖其它 OpenAI 系命名
-# （如 o3 / o4）时往这里加即可。匹配大小写不敏感、按子串包含判定。
-_TOOL_CLEAN_MODEL_KEYWORDS = ("gpt",)
-
-# usage 归一化仅对 Claude 系模型启用（B API 冷缓存场景特有；GPT 系走 OpenAI
-# 计费体系，usage 字段语义不同，不做归一化）。需扩展时往这里加关键字。
+# ---------- Claude usage 归一化 ----------
+# 仅对 Claude 系模型启用（B API 冷缓存场景特有）。需扩展时往这里加关键字。
 _USAGE_FIX_MODEL_KEYWORDS = ("claude",)
 
 # 解析失败（请求体非标准 JSON）时，从原文里精确抠出 model 字段值兜底判定。
@@ -586,29 +540,10 @@ def _extract_model(body_text) -> str:
     return ""
 
 
-def _model_wants_cleaning(model: str) -> bool:
-    """model 含 _TOOL_CLEAN_MODEL_KEYWORDS 任一关键字（不区分大小写）才需清洗。"""
-    low = model.lower()
-    return any(kw in low for kw in _TOOL_CLEAN_MODEL_KEYWORDS)
-
-
 def _model_wants_usage_fix(model: str) -> bool:
     """model 含 _USAGE_FIX_MODEL_KEYWORDS 任一关键字（不区分大小写）才做 usage 归一化。"""
     low = model.lower()
     return any(kw in low for kw in _USAGE_FIX_MODEL_KEYWORDS)
-
-
-def _clean_tool_input(obj):
-    """删除值为 None / 空串 / 哨兵占位符的字段；保留 0、false、[]、{} 等有效值。"""
-    if not isinstance(obj, dict):
-        return obj, 0
-    out, removed = {}, 0
-    for k, v in obj.items():
-        if v is None or (isinstance(v, str) and v in _TOOL_ARG_SENTINELS):
-            removed += 1
-            continue
-        out[k] = v
-    return out, removed
 
 
 def _sse_event(event_type: str, payload: dict) -> str:
@@ -616,38 +551,26 @@ def _sse_event(event_type: str, payload: dict) -> str:
     return f"event: {event_type}\ndata: {data}\n\n"
 
 
-class _SSEToolCleaner:
-    """增量解析 Anthropic SSE 流，仅重写 tool_use 块的输入参数，其余原样透传。
+class _SSEUsageNormalizer:
+    """增量解析 Anthropic SSE 流，按需归一化 Claude usage，其余原样透传。"""
 
-    用法：cleaner.feed(chunk_bytes) -> str（清洗后下发文本，可能为空）；
-    流结束时 cleaner.flush() -> str 吐出残留。
-
-    enabled=False 时（非 OpenAI 系模型）只做 UTF-8 增量解码后原样透传，不缓冲、
-    不解析、不重写——零副作用，避免误删原生模型合法传入的空串。
-    """
-
-    def __init__(self, enabled: bool = True, fix_usage: bool = False):
+    def __init__(self, enabled: bool = True):
         self.enabled = enabled
-        self.fix_usage = fix_usage
         self._dec = codecs.getincrementaldecoder("utf-8")()
         self._buf = ""
-        self._tools = {}  # index -> 缓冲中的 tool_use 块
-        self.cleaned_count = 0
         self._start_usage: dict | None = None  # message_start 时保存，供 delta 归一化
         self.usage_normalized = False
 
     def feed(self, chunk: bytes) -> str:
-        # 当 fix_usage 或 enabled 任一为 True 时，需要解析 SSE 事件；
-        # 两者都为 False（纯透传）时，直接返回解码结果，零解析开销。
         text = self._dec.decode(chunk)
-        if not self.enabled and not self.fix_usage:
+        if not self.enabled:
             return text
         self._buf += text
         return self._drain(final=False)
 
     def flush(self) -> str:
         text = self._dec.decode(b"", final=True)
-        if not self.enabled and not self.fix_usage:
+        if not self.enabled:
             return text
         self._buf += text
         return self._drain(final=True)
@@ -679,9 +602,7 @@ class _SSEToolCleaner:
             return event + "\n\n"
 
         t = obj.get("type")
-        idx = obj.get("index")
-
-        # --- usage 归一化：仅当 self.fix_usage 时介入（Claude 模型 + 全局开关开启）---
+        # --- usage 归一化（Claude 模型 + 全局开关开启）---
         # message_start 只做静默记录，不改写——避免 cache_read 被改大后触发
         # Claude Code 的自动压缩逻辑（CC 用 start.cache_read 作为压缩阈值判断）。
         # statusline 的修复只靠 message_delta 的归一化（见下），因为 CC 在
@@ -694,7 +615,7 @@ class _SSEToolCleaner:
             except Exception:
                 pass
 
-        if self.fix_usage and t == "message_delta" and self._start_usage is not None:
+        if t == "message_delta" and self._start_usage is not None:
             try:
                 start_total = (self._start_usage.get("input_tokens", 0)
                                + self._start_usage.get("cache_read_input_tokens", 0)
@@ -712,63 +633,7 @@ class _SSEToolCleaner:
             except Exception:
                 pass  # 解析异常原样透传
 
-        # --- tool 参数清洗：仅对 self.enabled 模型（GPT 系）生效 ---
-        if self.enabled and t == "content_block_start" and \
-                isinstance(obj.get("content_block"), dict) and \
-                obj["content_block"].get("type") == "tool_use":
-            cb = obj["content_block"]
-            self._tools[idx] = {
-                "id": cb.get("id"),
-                "name": cb.get("name"),
-                "start_input": cb.get("input") or {},
-                "partials": [],
-                "raw": [event + "\n\n"],
-            }
-            return ""  # 缓冲，等 stop 时统一重写
-
-        if t == "content_block_delta" and idx in self._tools and \
-                obj.get("delta", {}).get("type") == "input_json_delta":
-            buf = self._tools[idx]
-            buf["partials"].append(obj["delta"].get("partial_json", ""))
-            buf["raw"].append(event + "\n\n")
-            return ""  # 缓冲
-
-        if t == "content_block_stop" and idx in self._tools:
-            return self._rewrite(idx, self._tools.pop(idx), event)
-
         return event + "\n\n"  # 其余事件原样透传
-
-    def _rewrite(self, idx, buf, stop_event: str) -> str:
-        raw_json = "".join(buf["partials"]).strip()
-        try:
-            src = json.loads(raw_json) if raw_json else buf["start_input"]
-        except Exception:
-            src = None
-        if not isinstance(src, dict):
-            # 解析失败：原样回放，绝不破坏流
-            return "".join(buf["raw"]) + stop_event + "\n\n"
-
-        cleaned, removed = _clean_tool_input(src)
-        if removed == 0:
-            # 无需清洗，原样回放，保持流分块不变
-            return "".join(buf["raw"]) + stop_event + "\n\n"
-
-        self.cleaned_count += removed
-        js = json.dumps(cleaned, ensure_ascii=False, separators=(",", ":"))
-        return (
-            _sse_event("content_block_start", {
-                "type": "content_block_start", "index": idx,
-                "content_block": {"type": "tool_use", "id": buf["id"],
-                                  "name": buf["name"], "input": {}},
-            })
-            + _sse_event("content_block_delta", {
-                "type": "content_block_delta", "index": idx,
-                "delta": {"type": "input_json_delta", "partial_json": js},
-            })
-            + _sse_event("content_block_stop", {
-                "type": "content_block_stop", "index": idx,
-            })
-        )
 
 
 if __name__ == "__main__":
