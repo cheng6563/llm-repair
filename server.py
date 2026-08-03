@@ -119,7 +119,7 @@ parser.add_argument(
     action=argparse.BooleanOptionalAction,
     default=True,
     help="护盾：补全端点的空回复（200 但无文本/思考/工具调用）与上游 4xx/5xx "
-         "一律改写成 429 + Retry-After，让客户端自己重试。默认开启",
+         "一律改写成 503 让客户端自己重试。默认开启",
 )
 args, _ = parser.parse_known_args()
 
@@ -158,11 +158,11 @@ def filter_resp_headers(headers: httpx.Headers) -> dict:
     return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP}
 
 
-# ---------- 重试护盾（空回复 / 上游错误 → 429） ----------
+# ---------- 重试护盾（空回复 / 上游错误 → 503） ----------
 # 背景：部分三方渠道对某些请求会返回 HTTP 200 + 合法 SSE + [DONE]，但正文里
 #   没有任何可见输出（无 text / thinking / tool_use，completion_tokens≈0）。
 #   客户端（codex 等）把这当成“对话正常结束”，于是静默退出、不报错、不重试。
-#   护盾把这类空回复、以及上游 4xx/5xx，统一改写成 429 + Retry-After，让
+#   护盾把这类空回复、以及上游 4xx/5xx，统一改写成 503 + Retry-After，让
 #   CPA / codex 走各自的重试与渠道轮换逻辑，把无声失败变成可自愈的可见状态。
 # 只作用于“补全端点”，避免误伤 /v1/models 等辅助接口。
 _COMPLETION_PATH_SUFFIXES = (
@@ -247,7 +247,7 @@ def _json_has_visible_output(body) -> bool:
 
 
 def _rate_limited_response(is_anthropic: bool, reason: str) -> Response:
-    """构造 429，body 按客户端协议给对应错误形状，带 Retry-After 触发重试。"""
+    """构造 503，body 按客户端协议给对应错误形状，带 Retry-After 触发重试。"""
     if is_anthropic:
         payload = {"type": "error",
                    "error": {"type": "overloaded_error", "message": reason}}
@@ -256,7 +256,7 @@ def _rate_limited_response(is_anthropic: bool, reason: str) -> Response:
                              "code": "rate_limit_exceeded"}}
     return Response(
         content=json.dumps(payload, ensure_ascii=False),
-        status_code=429,
+        status_code=503,
         headers={"Retry-After": "1"},
         media_type="application/json",
     )
@@ -364,7 +364,7 @@ async def proxy(request: Request, path: str):
     parsed = urllib.parse.urlparse(url)
     model = _extract_model(body_text)
     fix_usage = FIX_USAGE and _model_wants_usage_fix(model)
-    # 护盾仅对补全端点生效；is_anthropic 决定 429 错误体用哪种协议形状
+    # 护盾仅对补全端点生效；is_anthropic 决定 503 错误体用哪种协议形状
     shield = RETRY_SHIELD and request.method == "POST" \
         and _is_completion_path(parsed.path)
     is_anthropic = (parsed.path or "").rstrip("/").lower().endswith("/messages")
@@ -404,9 +404,9 @@ async def proxy(request: Request, path: str):
         # 暂停，stream_gen 里接着往下读。
         byte_iter = upstream_resp.aiter_bytes()
 
-        # --- 护盾 peek：发头前先缓冲，扫描到可见输出才转直通；整条流为空则 429 ---
+        # --- 护盾 peek：发头前先缓冲，扫描到可见输出才转直通；整条流为空则 503 ---
         # 正常回复内容很快就来，peek 几乎不加延迟；空回复本就结束得快，不拖时间。
-        # 上游状态码本身是错误（4xx/5xx）时，同样吞掉并改 429。
+        # 上游状态码本身是错误（4xx/5xx）时，同样吞掉并改 503。
         peek_err = None
         if shield:
             try:
@@ -435,7 +435,7 @@ async def proxy(request: Request, path: str):
             }
             _write_session(session)
             _maybe_cleanup_logs()
-            log.info(f"[{req_id}] 护盾：{peek_err} → 429（{len(full)} 字符）")
+            log.info(f"[{req_id}] 护盾：{peek_err} → 503（{len(full)} 字符）")
             try:
                 await upstream_resp.aclose()
             except Exception:
@@ -511,7 +511,7 @@ async def proxy(request: Request, path: str):
         except Exception:
             body_decoded = f"<binary {len(content)} bytes>"
 
-        # 护盾：补全端点的上游错误 / 空回复 → 429
+        # 护盾：补全端点的上游错误 / 空回复 → 503
         shield_reason = None
         if shield:
             if upstream_resp.status_code >= 400:
@@ -531,7 +531,7 @@ async def proxy(request: Request, path: str):
         _maybe_cleanup_logs()
 
         if shield_reason:
-            log.info(f"[{req_id}] 护盾：{shield_reason} → 429（{len(content)} bytes）")
+            log.info(f"[{req_id}] 护盾：{shield_reason} → 503（{len(content)} bytes）")
             return _rate_limited_response(is_anthropic, f"upstream {shield_reason}, retry")
 
         log.info(f"[{req_id}] 完成，{len(content)} bytes")
