@@ -1,0 +1,14 @@
+services:
+  llm-repair:
+    build: .
+    container_name: llm-repair
+    restart: unless-stopped
+    volumes:
+      - ./logs:/data/logs
+    networks:
+      - app-net
+
+networks:
+  app-net:
+    external: true
+    name: app-net
